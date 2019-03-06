@@ -320,6 +320,34 @@ SpiDev_readbytesb(SpiDevObject *self, PyObject *args)
     return SpiDev_readbytes_generic(self, args, READBYTES_GENERIC_RESULTTYPE_BYTES);
 }
 
+static int
+SpiDev_check_buffer (Py_buffer const* ppybuff, int len, int offset)
+{
+    // Return true iff buffer is contiguous and [offset..offset+len) fits within it.
+
+    if (!PyBuffer_IsContiguous(ppybuff, 'A')) {
+        PyErr_SetString(PyExc_RuntimeError, "SpiDev: buffer must be contiguous.");
+        return 0;
+    }
+    if (ppybuff->len < 1) {
+        PyErr_SetString(PyExc_RuntimeError, "SpiDev: buffer must not be empty.");
+        return 0;
+    }
+    if (len < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "SpiDev: length must be positive.");
+        return 0;
+    }
+    if (offset < 0 || offset >= ppybuff->len - 1) { // NB must be space for at least one byte
+        PyErr_SetString(PyExc_RuntimeError, "SpiDev: offset out of range.");
+        return 0;
+    }
+    if (offset + len > ppybuff->len) {
+        PyErr_SetString(PyExc_RuntimeError, "SpiDev: offset+length would overflow buffer.");
+        return 0;
+    }
+    return 1;
+}
+
 
 PyDoc_STRVAR(SpiDev_readbuffer_doc,
              "read(bytearray [, length [, offset]]) -> [values]\n\n"
@@ -333,26 +361,9 @@ SpiDev_readbuffer(SpiDevObject *self, PyObject *args)
 
     if (!PyArg_ParseTuple(args, "y*|II", &pybuff, &len, &offset))
         return NULL;
-    if (!PyBuffer_IsContiguous(&pybuff, 'A')) {
-        PyErr_SetString(PyExc_RuntimeError, "SpiDev.readbuffer: buffer must be contiguous.");
+
+    if (!SpiDev_check_buffer(&pybuff, len, offset))
         return NULL;
-    }
-    if (pybuff.len < 1) {
-        PyErr_SetString(PyExc_RuntimeError, "SpiDev.readbuffer: buffer must not be empty.");
-        return NULL;
-    }
-    if (len < 0) {
-        PyErr_SetString(PyExc_RuntimeError, "SpiDev.readbuffer: length must be positive.");
-        return NULL;
-    }
-    if (offset < 0 || offset >= pybuff.len - 1) { // NB must be space for at least one byte
-        PyErr_SetString(PyExc_RuntimeError, "SpiDev.readbuffer: offset out of range.");
-        return NULL;
-    }
-    if (offset + len > pybuff.len) {
-        PyErr_SetString(PyExc_RuntimeError, "SpiDev.readbuffer: offset+length would overflow buffer.");
-        return NULL;
-    }
 
     if (len == 0)
         len = pybuff.len - offset;
@@ -809,6 +820,123 @@ SpiDev_xfer2(SpiDevObject *self, PyObject *args)
 	}
 
 	return seq;
+}
+
+PyDoc_STRVAR(SpiDev_xfer2b_doc,
+	"xfer2(txvalues, rxbytearray, offset=0, speedhz=0, delayus=0, bitsperword=0) -> [values]\n\n"
+	"Perform SPI transaction.\n"
+	"CS will be held active between blocks.\n");
+
+static PyObject *
+SpiDev_xfer2b(SpiDevObject *self, PyObject *args)
+{
+	int status;
+	uint16_t delay_usecs = 0;
+	uint32_t speed_hz = 0;
+	uint8_t bits_per_word = 0;
+	uint16_t ii = 0, len = 0, offset = 0;
+	PyObject *obj;
+	PyObject *seq;
+	struct spi_ioc_transfer xfer;
+	Py_BEGIN_ALLOW_THREADS
+	memset(&xfer, 0, sizeof(xfer));
+	Py_END_ALLOW_THREADS
+	uint8_t *txbuf, *rxbuf;
+	char	wrmsg_text[4096];
+	Py_buffer pybuff;
+
+	//if (!PyArg_ParseTuple(args, "O|IHB:xfer2", &obj, &speed_hz, &delay_usecs, &bits_per_word))
+	if (!PyArg_ParseTuple(args, "Oy*|IIHB:xfer2b", &obj, &pybuff, &offset, &speed_hz, &delay_usecs, &bits_per_word))
+		return NULL;
+
+    seq = PySequence_Fast(obj, "expected a sequence");
+    len = PySequence_Fast_GET_SIZE(obj);
+	if (!seq || len <= 0) {
+		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
+		return NULL;
+	}
+
+	if (len > SPIDEV_MAXPATH) {
+		snprintf(wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_listmax, SPIDEV_MAXPATH);
+		PyErr_SetString(PyExc_OverflowError, wrmsg_text);
+		return NULL;
+	}
+
+	if (!SpiDev_check_buffer(&pybuff, len, offset)) {
+	    return NULL;
+	}
+
+	Py_BEGIN_ALLOW_THREADS
+	txbuf = malloc(sizeof(__u8) * len);
+	Py_END_ALLOW_THREADS
+
+	rxbuf = pybuff.buf + offset;
+
+	for (ii = 0; ii < len; ii++) {
+		PyObject *val = PySequence_Fast_GET_ITEM(seq, ii);
+#if PY_MAJOR_VERSION < 3
+		if (PyInt_Check(val)) {
+			txbuf[ii] = (__u8)PyInt_AS_LONG(val);
+		} else
+#endif
+		{
+			if (PyLong_Check(val)) {
+				txbuf[ii] = (__u8)PyLong_AS_LONG(val);
+			} else {
+				snprintf(wrmsg_text, sizeof (wrmsg_text) - 1, wrmsg_val, val);
+				PyErr_SetString(PyExc_TypeError, wrmsg_text);
+				free(txbuf);
+				return NULL;
+			}
+		}
+	}
+
+	if (PyTuple_Check(obj)) {
+		Py_DECREF(seq);
+		seq = PySequence_List(obj);
+	}
+
+	Py_BEGIN_ALLOW_THREADS
+	xfer.tx_buf = (unsigned long)txbuf;
+	xfer.rx_buf = (unsigned long)rxbuf;
+	xfer.len = len;
+	xfer.delay_usecs = delay_usecs;
+	xfer.speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
+	xfer.bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
+
+	status = ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
+	Py_END_ALLOW_THREADS
+	if (status < 0) {
+		PyErr_SetFromErrno(PyExc_IOError);
+		free(txbuf);
+		return NULL;
+	}
+
+//	for (ii = 0; ii < len; ii++) {
+//		PyObject *val = Py_BuildValue("l", (long)rxbuf[ii]);
+//		PySequence_SetItem(seq, ii, val);
+//	}
+
+	// WA:
+	// in CS_HIGH mode CS isnt pulled to low after transfer
+	// reading 0 bytes doesn't really matter but brings CS down
+	// tomdean:
+	// Stop generating an extra CS except in mode CS_HOGH
+	if (self->mode & SPI_CS_HIGH) status = read(self->fd, &rxbuf[0], 0);
+
+	Py_BEGIN_ALLOW_THREADS
+	free(txbuf);
+	Py_END_ALLOW_THREADS
+
+
+//	if (PyTuple_Check(obj)) {
+//		PyObject *old = seq;
+//		seq = PySequence_Tuple(seq);
+//		Py_DECREF(old);
+//	}
+
+//	return seq;
+    Py_RETURN_NONE;
 }
 
 PyDoc_STRVAR(SpiDev_xfer3_doc,
@@ -1474,6 +1602,8 @@ static PyMethodDef SpiDev_methods[] = {
 		SpiDev_xfer_doc},
 	{"xfer2", (PyCFunction)SpiDev_xfer2, METH_VARARGS,
 		SpiDev_xfer2_doc},
+	{"xfer2b", (PyCFunction)SpiDev_xfer2b, METH_VARARGS,
+		SpiDev_xfer2b_doc},
 	{"xfer3", (PyCFunction)SpiDev_xfer3, METH_VARARGS,
 		SpiDev_xfer3_doc},
 	{"readbuffer", (PyCFunction)SpiDev_readbuffer, METH_VARARGS, SpiDev_readbuffer_doc},

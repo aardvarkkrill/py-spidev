@@ -1,4 +1,4 @@
-Python Spidev
+piPython Spidev
 =============
 
 This project contains a python module for interfacing with SPI devices from user space via the spidev linux kernel driver.
