@@ -301,7 +301,7 @@ SpiDev_readbytes_generic(SpiDevObject *self, PyObject *args, int resultType)
 
 
 PyDoc_STRVAR(SpiDev_read_doc,
-	"read(len) -> [values]\n\n"
+	"readbytes(len) -> [values]\n\n"
 	"Read len bytes from SPI device, returning a list.\n");
 
 static PyObject *
@@ -311,7 +311,7 @@ SpiDev_readbytes(SpiDevObject *self, PyObject *args)
 }
 
 PyDoc_STRVAR(SpiDev_readb_doc,
-             "read(len) -> bytes(len)\n\n"
+             "readbytesb(len) -> bytes(len)\n\n"
              "Read len bytes from SPI device, returning a bytes object of length len.\n");
 
 static PyObject *
